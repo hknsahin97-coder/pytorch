@@ -6,6 +6,7 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from pathlib import Path
 from types import MethodType
 from typing import Any, TYPE_CHECKING, TypeGuard
 
@@ -379,6 +380,47 @@ def _spawns_multiple_processes(
     )
 
     return issubclass(cls, (MultiProcessTestCase, MultiProcContinuousTest))
+
+
+def _cgroup_memory_mib() -> int | None:
+    """Current container memory usage in MiB, or None outside a cgroup.
+
+    memory.current is what the OOM killer watches, and it covers every process
+    in the container, not just this pytest worker.
+    """
+    for path in (
+        "/sys/fs/cgroup/memory.current",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+    ):
+        try:
+            return int(Path(path).read_text().strip()) // (1024 * 1024)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def pytest_runtest_logstart(nodeid: str, location: Any) -> None:
+    """Announce each test and the container's memory use before running it.
+
+    An OOM kill takes the container down with no traceback and no flushed
+    pytest output, so the only way to learn which test was responsible is to
+    have already said so. The last line before the kill names the test and how
+    close the container already was.
+
+    Off by default. PYTORCH_TEST_RSS_TRACE=1 traces everything; a comma-
+    separated list traces only matching files, e.g. PYTORCH_TEST_RSS_TRACE=
+    test_nn,nn/test_convolution, which keeps the noise off the other shards.
+    """
+    want = os.getenv("PYTORCH_TEST_RSS_TRACE", "")
+    if not want:
+        return
+    if want != "1":
+        wanted = {w.strip() for w in want.split(",") if w.strip()}
+        if not any(w and w in nodeid for w in wanted):
+            return
+    used = _cgroup_memory_mib()
+    used_str = f"{used}MiB" if used is not None else "unknown"
+    print(f"[rss-trace] container at {used_str} before {nodeid}", flush=True)
 
 
 def pytest_itemcollected(item: Any) -> None:

@@ -322,6 +322,10 @@ jobs:
           ARTIFACTS_FILE_SUFFIX: ${{ github.job }}-${{ matrix.config }}-${{ matrix.shard }}-${{ matrix.num_shards }}-${{ matrix.runner }}_${{ steps.setup-linux.outputs.job-id }}
           TORCH_TPU_TEXT_FILE: /var/lib/jenkins/workspace/.github/ci_commit_pins/torch_tpu.txt
           USE_ARC: "1"
+          # TEMPORARY, for #197326: an OOM kill leaves no traceback, so have the
+          # heavy files announce themselves and the container's memory use
+          # before each test. The last line before the kill names the culprit.
+          PYTORCH_TEST_RSS_TRACE: "test_nn,nn/test_convolution,inductor/test_loop_ordering,test_jit"
         shell: bash
         run: |
           set -x
