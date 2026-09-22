@@ -50,6 +50,7 @@ from torch._C._distributed_c10d import ErrorType, OpType, WorkResult
 from torch.nn.parallel import DistributedDataParallel
 from torch.testing._internal.common_cuda import _get_torch_rocm_version, TEST_MULTIGPU
 from torch.testing._internal.common_distributed import (
+    core_dumps_disabled,
     get_required_world_size,
     get_timeout,
     init_multigpu_helper,
@@ -355,13 +356,10 @@ class ProcessGroupNCCLGroupTest(MultiProcessTestCase):
     def setUp(self):
         super().setUp()
 
-        # These tests are expected to exit with SIGABRT(6). The reporting
-        # mechanism differs by platform but the observable result does not:
-        #
-        # CUDA: device-side assert -> CUDA runtime surfaces it as an error ->
-        #       the test catches it and exits 6
-        # ROCm: check kernel sets a host-read flag -> the collective raises ->
-        #       the test catches it and exits 6
+        # These tests are expected to exit with SIGABRT(6): the device-side
+        # assert is surfaced as an error by the runtime, the test catches it
+        # and exits 6. That holds on ROCm too, as long as the child has core
+        # dumps off - see core_dumps_disabled() in test_nan_assert.
         #
         # But if we are in Sandcastle, `skip_but_pass_in_sandcastle` would return 0.
         TEST_NAN_ASSERT_RETURN = (
@@ -622,12 +620,13 @@ class ProcessGroupNCCLGroupTest(MultiProcessTestCase):
         # pg.all_gather_single(output, nan_tensor)
 
         backend._set_enable_nan_check(True)
-        try:
-            pg.all_gather_single(output, nan_tensor)
-        except Exception:
-            sys.exit(signal.SIGABRT)
+        with core_dumps_disabled():
+            try:
+                pg.all_gather_single(output, nan_tensor)
+            except Exception:
+                sys.exit(signal.SIGABRT)
 
-        dist.destroy_process_group()
+            dist.destroy_process_group()
 
         # reset env
         os.environ["TORCH_NCCL_NAN_CHECK"] = "0"

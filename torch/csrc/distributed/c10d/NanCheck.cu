@@ -5,19 +5,11 @@
 #include <torch/library.h>
 #include <algorithm>
 
-#if defined(USE_ROCM)
-#ifndef AT_PER_OPERATOR_HEADERS
-#include <ATen/Functions.h>
-#else
-#include <ATen/ops/zeros.h>
-#endif
-#endif
-
 namespace c10d {
 namespace {
 
-// CUDA kernel to check if data has NAN. See `reportNan` for how a detected
-// NaN gets back to the caller, which differs between CUDA and ROCm.
+// CUDA kernel to check if data has NAN, device side assert
+// is raised if NAN is found
 
 // Using ulong2 as a "byte pack", with 16 bytes, for efficient data load
 union BytePack16 {
@@ -35,14 +27,12 @@ typedef union BytePack16 BytePack;
 
 template <typename T, int EltPerPack>
 struct CheckBytePack {
-  static __device__ __forceinline__ bool hasNan(BytePack* tmp) {
+  static __device__ __forceinline__ void check(BytePack* tmp) {
     T* data = (T*)tmp;
-    bool found = false;
 #pragma unroll 8
     for (int i = 0; i < EltPerPack; i++) {
-      found |= isnan(data[i]);
+      CUDA_KERNEL_ASSERT(!isnan(data[i]));
     }
-    return found;
   }
 };
 
@@ -51,9 +41,9 @@ struct CheckBytePack {
 
 template <typename T>
 struct CheckBytePack<T, /*EltPerPack*/ 2> {
-  static __device__ __forceinline__ bool hasNan(BytePack* tmp) {
+  static __device__ __forceinline__ void check(BytePack* tmp) {
     T* data = (T*)tmp;
-    return isnan(data[0]) || isnan(data[1]);
+    CUDA_KERNEL_ASSERT(!isnan(data[0]) && !isnan(data[1]));
   }
 };
 
@@ -62,10 +52,11 @@ struct CheckBytePack<T, /*EltPerPack*/ 2> {
 
 template <typename T>
 struct CheckBytePack<T, /*EltPerPack*/ 4> {
-  static __device__ __forceinline__ bool hasNan(BytePack* tmp) {
+  static __device__ __forceinline__ void check(BytePack* tmp) {
     T* data = (T*)tmp;
-    return isnan(data[0]) || isnan(data[1]) || isnan(data[2]) ||
-        isnan(data[3]);
+    CUDA_KERNEL_ASSERT(
+        !isnan(data[0]) && !isnan(data[1]) && !isnan(data[2]) &&
+        !isnan(data[3]));
   }
 };
 
@@ -74,11 +65,12 @@ struct CheckBytePack<T, /*EltPerPack*/ 4> {
 
 template <typename T>
 struct CheckBytePack<T, /*EltPerPack*/ 8> {
-  static __device__ __forceinline__ bool hasNan(BytePack* tmp) {
+  static __device__ __forceinline__ void check(BytePack* tmp) {
     T* data = (T*)tmp;
-    return isnan(data[0]) || isnan(data[1]) || isnan(data[2]) ||
-        isnan(data[3]) || isnan(data[4]) || isnan(data[5]) || isnan(data[6]) ||
-        isnan(data[7]);
+    CUDA_KERNEL_ASSERT(
+        !isnan(data[0]) && !isnan(data[1]) && !isnan(data[2]) &&
+        !isnan(data[3]) && !isnan(data[4]) && !isnan(data[5]) &&
+        !isnan(data[6]) && !isnan(data[7]));
   }
 };
 
@@ -142,9 +134,10 @@ struct HasNanFP8x8<c10::Float8_e5m2> {
 
 template <typename T>
 struct CheckBytePack<T, /*EltPerPack*/ 16> {
-  static __device__ __forceinline__ bool hasNan(BytePack* tmp) {
-    return HasNanFP8x8<T>::check(tmp->ul[0]) ||
-        HasNanFP8x8<T>::check(tmp->ul[1]);
+  static __device__ __forceinline__ void check(BytePack* tmp) {
+    CUDA_KERNEL_ASSERT(
+        !HasNanFP8x8<T>::check(tmp->ul[0]) &&
+        !HasNanFP8x8<T>::check(tmp->ul[1]));
   }
 };
 
@@ -157,7 +150,7 @@ struct CheckBytePack<T, /*EltPerPack*/ 16> {
 #define UNROLL 8
 
 template <typename T>
-__device__ __forceinline__ bool chunkHasNan(BytePack* ptr) {
+__device__ __forceinline__ void checkChunk(BytePack* ptr) {
   BytePack tmp[UNROLL];
   int nWorkers = blockDim.x * gridDim.x;
 // First load values from global memory into tmp buffer
@@ -165,43 +158,22 @@ __device__ __forceinline__ bool chunkHasNan(BytePack* ptr) {
   for (int j = 0; j < UNROLL; j++) {
     tmp[j] = ptr[nWorkers * j];
   }
-  bool found = false;
 // Then check each BytePack in the tmp buffer
 #pragma unroll 8
   for (int j = 0; j < UNROLL; j++) {
-    found |= CheckBytePack<T, sizeof(BytePack) / sizeof(T)>::hasNan(tmp + j);
+    CheckBytePack<T, sizeof(BytePack) / sizeof(T)>::check(tmp + j);
   }
   // Note: we separate the check from the load for efficient loading
-  return found;
 }
 
 // Align address of `ptr` up, to the alignment of `T`
 #define ALIGN_UP(ptr, T) \
   (((uintptr_t)ptr + sizeof(T) - 1) / sizeof(T) * sizeof(T))
 
-// How a detected NaN is reported differs by platform. On CUDA the device-side
-// assert is kept: it costs nothing on the launch path and stays capturable
-// into a CUDA graph, whereas reading a flag back on the host would synchronize
-// before every checked collective. On ROCm the assert is unusable: with
-// USE_ROCM_KERNEL_ASSERT=OFF (the default) CUDA_KERNEL_ASSERT compiles to a
-// device abort(), which raises a hardware exception and lets the HSA
-// queue-error callback kill the process. No status ever reaches the host, so
-// the error that c10d::checkForNan is documented to throw could never be
-// raised. There the result travels back through `hasNan`, which the host reads
-// once the kernel has completed. Every writer stores the same value, so the
-// racing stores need no atomic. `hasNan` is null on CUDA.
-__device__ __forceinline__ void reportNan([[maybe_unused]] int32_t* hasNan) {
-#if defined(USE_ROCM)
-  *hasNan = 1;
-#else
-  CUDA_KERNEL_ASSERT_MSG(false, "NaN found in input tensor");
-#endif
-}
-
 // This is the host-facing kernel
 
 template <typename T>
-__global__ void checkForNaN(T* data, size_t size, int32_t* hasNan) {
+__global__ void checkForNaN(T* data, size_t size) {
   constexpr int EltPerPack = sizeof(BytePack) / sizeof(T);
   // Offset of current thread
   size_t offset = blockIdx.x * blockDim.x + threadIdx.x;
@@ -212,9 +184,8 @@ __global__ void checkForNaN(T* data, size_t size, int32_t* hasNan) {
   size_t preProcElts = min(ptrAlign - data, size);
   // Read memory by T (slow). One iter is enough bc the number of threads would
   // be bigger than `preProcElts`
-  if (offset < preProcElts && isnan(data[offset])) {
-    reportNan(hasNan);
-    return;
+  if (offset < preProcElts) {
+    CUDA_KERNEL_ASSERT(!isnan(data[offset]));
   }
   // We have processes this amount of data
   size -= preProcElts;
@@ -229,29 +200,21 @@ __global__ void checkForNaN(T* data, size_t size, int32_t* hasNan) {
   // Fast path
   // The condition below makes sure there is enough data to process (`loopSize`)
   for (; offset + loopSize <= sizeInBP; offset += loopSize) {
-    if (chunkHasNan<T>(ptr + offset)) {
-      reportNan(hasNan);
-      return;
-    }
+    checkChunk<T>(ptr + offset);
   }
 
   // The rest data goes on slow path
   // We just do regular load and check
   for (; offset < sizeInBP; offset += blockDim.x * gridDim.x) {
     BytePack tmp = ptr[offset];
-    if (CheckBytePack<T, EltPerPack>::hasNan(&tmp)) {
-      reportNan(hasNan);
-      return;
-    }
+    CheckBytePack<T, EltPerPack>::check(&tmp);
   }
 
   // We can still have a tail smaller than 1 BytePack
   // TODO: merge this tail check with head check to make them concurrent
   if (threadIdx.x < size % EltPerPack) {
     T* tailPtr = (T*)(ptr + sizeInBP);
-    if (isnan(tailPtr[threadIdx.x])) {
-      reportNan(hasNan);
-    }
+    CUDA_KERNEL_ASSERT(!isnan(tailPtr[threadIdx.x]));
   }
 }
 
@@ -272,17 +235,7 @@ void check_for_nan_cuda(const at::Tensor& tensor) {
       maxNumBlocks,
       (tensor.numel() + numThreadsPerBlock - 1) / numThreadsPerBlock);
 
-  // The flag below is zeroed on the current stream of the current device, so
-  // that has to be the stream the kernel is launched on.
-  c10::cuda::CUDAGuard device_guard(tensor.device());
   auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
-
-#if defined(USE_ROCM)
-  auto hasNan = at::zeros({}, tensor.options().dtype(at::kInt));
-  auto* hasNanPtr = hasNan.mutable_data_ptr<int32_t>();
-#else
-  int32_t* hasNanPtr = nullptr;
-#endif
 
   AT_DISPATCH_FLOATING_TYPES_AND4(
       at::ScalarType::Half,
@@ -293,22 +246,9 @@ void check_for_nan_cuda(const at::Tensor& tensor) {
       "checkForNaN",
       [&] {
         checkForNaN<scalar_t><<<numBlocks, numThreadsPerBlock, 0, stream>>>(
-            tensor.data_ptr<scalar_t>(), tensor.numel(), hasNanPtr);
+            tensor.data_ptr<scalar_t>(), tensor.numel());
         C10_CUDA_KERNEL_LAUNCH_CHECK();
       });
-
-#if defined(USE_ROCM)
-  // Reading the flag synchronizes with the check kernel, so the throw happens
-  // before the caller can enqueue work that consumes the tensor.
-  TORCH_CHECK(
-      hasNan.item<int32_t>() == 0,
-      "NaN found in input tensor. device=",
-      tensor.device(),
-      ", dtype=",
-      tensor.scalar_type(),
-      ", numel=",
-      tensor.numel());
-#endif
 }
 
 TORCH_LIBRARY_IMPL(c10d, CUDA, m) {

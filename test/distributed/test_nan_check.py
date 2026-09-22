@@ -73,16 +73,6 @@ class TestNanCheck(TestCase):
         self._check_for_nan(torch.randn(100000, device=ACCELERATOR))
         torch.accelerator.synchronize()
 
-    # CUDA reports a device NaN with a device-side assert, which kills the
-    # process instead of raising; only ROCm routes it back through the host.
-    @unittest.skipUnless(
-        HAS_ACCELERATOR and torch.version.hip, "requires a ROCm accelerator"
-    )
-    def test_nan_float32_accelerator(self):
-        tensor = torch.tensor([1.0, float("nan")], device=ACCELERATOR)
-        with self.assertRaisesRegex(RuntimeError, "NaN found in input tensor"):
-            self._check_for_nan(tensor)
-
     def test_nan_float32(self):
         tensor = torch.tensor([1.0, 2.0, float("nan"), 4.0])
         with self.assertRaisesRegex(RuntimeError, "NaN"):
