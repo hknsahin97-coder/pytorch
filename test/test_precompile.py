@@ -4705,8 +4705,15 @@ class TestPrecompileDynamoCapture(TestCase):
             # continuation, and the keyword argument is a second entry variant.
             y2 = cap(self.model, self.x2)
             y3 = cap(self.model, self.x3, scale=0.5)
+            summary = cap.summary()
         self.assertEqual(y2, step(self.model, self.x2))
         self.assertEqual(y3, step(self.model, self.x3, scale=0.5))
+        # The entry and its graph-break continuation, each with a variant per
+        # call the guards told apart.
+        self.assertTrue(summary.complete, str(summary))
+        self.assertEqual(summary.frames, 2)
+        self.assertEqual(summary.resume_functions, 1)
+        self.assertGreaterEqual(summary.guarded_codes, 3)
         with open(self.artifact) as f:
             python_code = f.read()
         self.assertIn('TRACER = "dynamo"', python_code)
@@ -4753,14 +4760,29 @@ class TestPrecompileDynamoCapture(TestCase):
         self.model.load_state_dict(state)
         self._serve_in_fresh_process([((self.x2,), {}, None)], grads)
 
+    def test_save_checkpoints_mid_block(self):
+        step = self.mod.step
+        with self._capture(step, backend="eager") as cap:
+            with self.assertRaisesRegex(PrecompileError, "nothing was captured"):
+                cap.save()
+            cap(self.model, self.x2)
+            cap.save()
+            with open(self.artifact, "rb") as f:
+                checkpoint = f.read()
+            cap(self.model, self.x3)
+        with open(self.artifact, "rb") as f:
+            self.assertNotEqual(f.read(), checkpoint)
+
     def test_a_raised_call_is_refused_at_exit_and_writes_nothing(self):
         # A call that raised inside the block is a coverage gap: the default gate
-        # refuses at exit, after the block ran to completion, and writes nothing.
+        # refuses at exit, after the block ran to completion, and writes nothing;
+        # the summary stays readable and says why.
         with self.assertRaisesRegex(PrecompileError, "captured call raised"):
             with self._capture(self.mod.step, backend="eager") as cap:
                 cap(self.model, self.x2)
                 with self.assertRaises(RuntimeError):
                     cap(self.model, torch.randn(2, 5))
+                self.assertFalse(cap.summary().complete)
         self.assertFalse(os.path.exists(self.artifact))
         self.assertFalse(os.path.exists(self.cache))
         # A call that raised on every attempt still reaches that gate.
@@ -4845,14 +4867,21 @@ class TestPrecompileDynamoCapture(TestCase):
         with self.assertRaisesRegex(PrecompileError, "no captured variant"):
             load(self.artifact, self.cache)(self.model, self.x3)
 
-    def test_dropped_guards_are_listed_in_the_artifact(self):
+    def test_dropped_guards_are_reported_in_the_summary_and_the_artifact(self):
         # The default filter drops the identity guards that cannot be
-        # serialized (the MODULE_MATCH on the model here); the artifact lists
-        # them.
+        # serialized (the MODULE_MATCH on the model here); the summary reports
+        # them and the artifact lists the same slots.
         with self._capture(self.mod.single, backend="eager") as cap:
             cap(self.model, self.x2)
+            summary = cap.summary()
+        self.assertTrue(summary.complete)
+        self.assertIn("MODULE_MATCH", summary.dropped_guard_types)
+        self.assertTrue(summary.kept_guards)
+        self.assertEqual(summary.risky_dropped_guards, ())
         with open(self.artifact) as f:
-            self.assertIn("['MODULE_MATCH', ", f.read())
+            python_code = f.read()
+        for guard_type, source in summary.dropped_guards:
+            self.assertIn(f"[{guard_type!r}, {source!r}]", python_code)
 
     def test_entries_a_standalone_artifact_cannot_rebuild_are_refused(self):
         # A bare nn.Module compiles Dynamo's wrapper frame, whose graphs close
