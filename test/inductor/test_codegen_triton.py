@@ -3,10 +3,11 @@ import ast
 import contextlib
 import dataclasses
 import re
+import sys
 import unittest
 from collections import namedtuple, OrderedDict
 from enum import Enum, IntEnum
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import sympy
@@ -30,7 +31,12 @@ from torch._inductor.codegen.triton import (
     TritonKernelOverrides,
     TritonSymbols,
 )
-from torch._inductor.codegen.wrapper import _escape_triton_kernel_source_for_wrapper
+from torch._inductor.codegen.wrapper import (
+    _escape_triton_kernel_source_for_wrapper,
+    render_user_defined_triton_kernel_transitive_closure,
+    user_defined_triton_kernel_transitive_closure,
+    user_defined_triton_kernel_transitive_closure_source_code,
+)
 from torch._inductor.dtype_propagation import DtypePropagationOpsHandler, promote_types
 from torch._inductor.graph import GraphLowering
 from torch._inductor.runtime.hints import AutotuneHint, DeviceProperties
@@ -79,6 +85,30 @@ except ImportError:
         UserDefinedTritonKernelNestedConfig,
         UserDefinedTritonKernelNonInitConfig,
     )
+
+
+if has_triton_package():
+    import triton
+
+    @triton.jit
+    def _test_transitive_helper(x):
+        return x + 1
+
+    @triton.jit
+    def _test_transitive_kernel(x):
+        return _test_transitive_helper(x)
+
+    if hasattr(triton, "constexpr_function"):
+
+        @triton.constexpr_function
+        def transitive_constexpr_helper(x):
+            return x + 1
+
+        transitive_constexpr_alias = transitive_constexpr_helper
+
+        @triton.jit
+        def _test_transitive_alias_kernel(x):
+            return transitive_constexpr_alias(x)
 
 
 class TestCodegenTriton(InductorTestCase):
@@ -323,6 +353,73 @@ def helper(x):
 
             call = ast.parse(wrapper_src).body[0].value
             self.assertEqual(ast.literal_eval(call.args[1]), source)
+
+    @unittest.skipUnless(has_triton_package(), "requires Triton")
+    def test_user_defined_triton_kernel_transitive_closure(self):
+        source_modules = user_defined_triton_kernel_transitive_closure(
+            _test_transitive_kernel
+        )
+        source = user_defined_triton_kernel_transitive_closure_source_code(
+            _test_transitive_kernel
+        )
+
+        # The root kernel is always retained, independent of injected modules.
+        kernel_source = source_modules[0]
+        self.assertIsNone(kernel_source.module_name)
+        self.assertIn("def _test_transitive_kernel", kernel_source.source)
+
+        # Dependencies retain their defining module for filtering.
+        self.assertTrue(
+            any(
+                source_module.module_name == _test_transitive_helper.fn.__module__
+                and "def _test_transitive_helper" in source_module.source
+                for source_module in source_modules
+            )
+        )
+
+        # The compatibility API composes collection and formatting.
+        self.assertEqual(
+            source,
+            render_user_defined_triton_kernel_transitive_closure(source_modules),
+        )
+
+    @unittest.skipUnless(
+        has_triton_package() and hasattr(triton, "constexpr_function"),
+        "requires triton.constexpr_function",
+    )
+    def test_user_defined_triton_kernel_transitive_closure_alias(self):
+        module_name = "test_triton_transitive_helper"
+        helper_module = ModuleType(module_name)
+        helper_module.transitive_constexpr_helper = transitive_constexpr_helper
+
+        with (
+            patch.object(
+                transitive_constexpr_helper.fn, "__module__", module_name
+            ),
+            patch.dict(sys.modules, {module_name: helper_module}),
+        ):
+            source_modules = user_defined_triton_kernel_transitive_closure(
+                _test_transitive_alias_kernel
+            )
+            source_modules = [
+                dataclasses.replace(
+                    source_module,
+                    source=f"from {module_name} import *\n",
+                )
+                if source_module.module_name == module_name
+                else source_module
+                for source_module in source_modules
+            ]
+            source = render_user_defined_triton_kernel_transitive_closure(
+                source_modules
+            )
+            rendered_globals: dict[str, object] = {}
+            exec(source, rendered_globals)
+
+        self.assertIs(
+            rendered_globals["transitive_constexpr_alias"],
+            transitive_constexpr_helper,
+        )
 
     def test_persistent_reduction_choice_two_arg_override(self):
         seen_scores = []
