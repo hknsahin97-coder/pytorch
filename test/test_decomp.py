@@ -1180,6 +1180,26 @@ instantiate_device_type_tests(TestDecomp, globals())
 class DecompOneOffTests(TestCase):
     @onlyNativeDeviceTypes
     @skipIfCrossRef
+    def test_polar_ref_is_functional(self, device):
+        # A decomposition runs into a graph that must stay functional, so the ref
+        # may not build its result and then write the parts into it.
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        dist = torch.rand(8, device=device)
+        angle = torch.randn(8, device=device)
+
+        gm = make_fx(torch._refs._conversions.polar)(dist, angle)
+        mutating = [
+            node.target
+            for node in gm.graph.nodes
+            if isinstance(node.target, torch._ops.OpOverload)
+            and node.target._schema.is_mutable
+        ]
+        self.assertEqual(mutating, [])
+        self.assertEqual(torch._refs._conversions.polar(dist, angle), torch.polar(dist, angle))
+
+    @onlyNativeDeviceTypes
+    @skipIfCrossRef
     def test_contiguous_softmax(self, device):
         size = (2, 4, 3, 3)
         stride = (9, 18, 3, 1)
