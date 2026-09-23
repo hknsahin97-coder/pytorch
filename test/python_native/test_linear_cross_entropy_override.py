@@ -10,7 +10,7 @@ import unittest.mock
 
 import torch
 import torch._native.registry as registry_module
-from torch._native import cutedsl_utils as cu
+from torch._native import cutedsl_utils as cu, variants
 from torch._native.ops.linear_cross_entropy import cutedsl_impl
 from torch.nn.modules.linear_cross_entropy_options import LinearCrossEntropyOptions
 from torch.testing._internal.common_cuda import (
@@ -28,13 +28,18 @@ from torch.testing._internal.common_utils import (
 
 
 _OP_SYMBOLS = [op_symbol for op_symbol, _, _ in cutedsl_impl._OVERRIDES]
+_SCALAR_OP = "_linear_cross_entropy_batch_chunked"
+# Self-discovered, so promoting or adding a variant needs no change here.
+_KERNEL_VARIANTS = sorted(
+    name for name in cutedsl_impl._VARIANTS[_SCALAR_OP] if name != variants.PASSTHROUGH
+)
 
 
 # Repeated on every test that needs a live kernel rather than a fallback.
 _needs_kernel = unittest.skipIf(
     not TEST_CUDA or not cutedsl_impl._arch_supported(),
-    "the kernel declines this device, so there is no kernel path to test "
-    "-- the call would fall back to eager",
+    "no kernel variant is eligible on this device, so there is no kernel "
+    "path to test -- the call would fall back to eager",
 )
 
 
@@ -118,12 +123,11 @@ class TestLinearCrossEntropyOverride(TestCase):
         """A call must route to one of the registered overrides: exporting and
         applying the registry's decomposition table puts the override's own
         ``_native::<node_id>`` op in the graph exactly when the call is routed
-        to it. ``mean`` reaches the scalar-reduction override, whose `cond` is
-        the kernel's gate; ``none`` reaches the unconditional no_reduction one,
-        so only ``mean`` is skipped where the kernel declines the device.
+        to it. ``mean`` reaches the scalar-reduction override, ``none`` the
+        no_reduction one. Pinned to ``passthrough``, so this tests the router's
+        installation independently of which inputs a kernel variant accepts on
+        this GPU.
         """
-        if reduction == "mean" and not cutedsl_impl._arch_supported():
-            self.skipTest("the scalar op's kernel declines this device")
         expected = {
             f"_native::{node.node_id}"
             for op_symbol in _OP_SYMBOLS
@@ -145,8 +149,13 @@ class TestLinearCrossEntropyOverride(TestCase):
             torch.randn(num_batches, in_features, device="cuda", dtype=torch.float16),
             torch.randint(0, num_classes, (num_batches,), device="cuda"),
         )
-        exported = torch.export.export(module, args)
-        decomposed = exported.run_decompositions(registry_module.native_decomp_table())
+        with torch.backends.python_native.override_variant(
+            f"torch_nn::{_SCALAR_OP}", variants.PASSTHROUGH
+        ):
+            exported = torch.export.export(module, args)
+            decomposed = exported.run_decompositions(
+                registry_module.native_decomp_table()
+            )
         # Match on namespace and exact node id: node_id embeds the op symbol,
         # and one op symbol is a prefix of the other.
         routed = [
@@ -171,9 +180,9 @@ class TestLinearCrossEntropyOverride(TestCase):
         generator's whole sample space and in both grad modes, that the filter
         passes the right arguments and that the predicate agrees with the call:
         the shared accumulator runs if and only if a chunked op does. The
-        cutedsl overrides are disabled, since an eligible kernel replaces the
-        accumulator and would hide a reached op. The predicate is evaluated
-        under the call's grad mode, since one clause reads
+        cutedsl overrides are disabled, since an eligible kernel variant
+        replaces the accumulator and would hide a reached op. The predicate is
+        evaluated under the call's grad mode, since one clause reads
         ``torch.is_grad_enabled()``.
         """
         import torch.nn.modules.linear_cross_entropy as lce_module
@@ -750,7 +759,8 @@ torch.cuda.synchronize()
         )
 
     @_needs_kernel
-    def test_kernel_path_is_deterministic(self):
+    @parametrize("variant", _KERNEL_VARIANTS)
+    def test_kernel_path_is_deterministic(self, variant):
         """Two identical calls give bit-identical gradients: a GEMM and a
         fixed-order column sum replace eager's atomic `index_add_`. The absence
         of the scatter is asserted separately, by spying on `index_add_`,
@@ -777,10 +787,17 @@ torch.cuda.synchronize()
                 t.detach().clone().requires_grad_()
                 for t in (input, linear_weight, linear_bias)
             ]
-            loss = torch.nn.functional.linear_cross_entropy(
-                leaves[0], leaves[1], target, linear_bias=leaves[2], options=options
-            )
-            loss.backward()
+            with torch.backends.python_native.override_variant(
+                f"torch_nn::{_SCALAR_OP}", variant
+            ):
+                loss = torch.nn.functional.linear_cross_entropy(
+                    leaves[0],
+                    leaves[1],
+                    target,
+                    linear_bias=leaves[2],
+                    options=options,
+                )
+                loss.backward()
             return (loss.detach(), *(t.grad for t in leaves))
 
         scatters = []
@@ -790,8 +807,8 @@ torch.cuda.synchronize()
             scatters.append(1)
             return unpatched_index_add_(self, *args, **kwargs)
 
-        # The kernel replaces the accumulator, so any entry into it means the
-        # call fell back and this test never saw the kernel path.
+        # The kernel variants replace the accumulator, so any entry into it
+        # means the call fell back and this test never saw the kernel path.
         with (
             unittest.mock.patch.object(
                 lce_module,
@@ -805,16 +822,16 @@ torch.cuda.synchronize()
             self.assertEqual(
                 accumulator.call_count,
                 0,
-                "the call fell back to the accumulator, so this asserted "
-                "determinism of the eager path, not the kernel's",
+                f"variant {variant!r} fell back to the accumulator, so this "
+                "asserted determinism of the eager path, not the kernel's",
             )
         names = ("loss", "grad_input", "grad_linear_weight", "grad_linear_bias")
         for name, a, b in zip(names, first, second):
             if not torch.equal(a, b):
                 self.fail(
-                    f"{name} differs between two identical runs (max abs diff "
-                    f"{(a - b).abs().max().item():.3e}), so the kernel path is "
-                    "not deterministic"
+                    f"variant {variant!r}: {name} differs between two identical "
+                    f"runs (max abs diff {(a - b).abs().max().item():.3e}), so "
+                    "the kernel path is not deterministic"
                 )
 
 
