@@ -229,18 +229,17 @@ it.
 # so concurrent backend="inductor" captures lower one at a time. The make_fx trace
 # and the backend="eager" path are NOT serialized.
 #
-# tracer: the capture front-end, orthogonal to backend. MakeFxTracer (the default) is
-# the non-strict trace everything above describes (the invariants, the contract).
-# DynamoTracer analyzes the Python instead of specializing to one traced path: it
-# records every frame Dynamo compiles while the caller's calls run -- the entry, the
-# graph-break continuations, the recompiled variants -- with one guard tree per
-# variant, and the artifact dispatches among them at call time. Its artifact is
-# standalone (it installs nothing) and is locked to the producing Python version and
-# torch build, since it inlines serialized bytecode and pickled guard state.
-# Invariants 1, 2, 3 and 6 above are the make_fx contract; under Dynamo a call outside
-# the captured variants is REFUSED by the guards rather than silently served, and the
-# guards that could not be serialized are listed in the artifact (DROPPED_GUARDS)
-# rather than checked.
+# tracer: the capture front-end, orthogonal to backend. MakeFxTracer is the non-strict
+# trace everything above describes (the invariants, the contract). DynamoTracer (the
+# default) analyzes the Python instead of specializing to one traced path: it records
+# every frame Dynamo compiles while the caller's calls run -- the entry, the graph-break
+# continuations, the recompiled variants -- with one guard tree per variant, and the
+# artifact dispatches among them at call time. Its artifact is standalone (it installs
+# nothing) and is locked to the producing Python version and torch build, since it
+# inlines serialized bytecode and pickled guard state. Invariants 1, 2, 3 and 6 above
+# are the make_fx contract; under Dynamo a call outside the captured variants is
+# REFUSED by the guards rather than silently served, and the guards that could not be
+# serialized are reported (PrecompileSummary.dropped_guards) rather than checked.
 
 from __future__ import annotations
 
@@ -380,7 +379,7 @@ class MakeFxTracer:
 
 @dataclasses.dataclass(frozen=True)
 class DynamoTracer:
-    """The ``dynamo`` capture front-end, passed as ``tracer=`` to
+    """The ``dynamo`` capture front-end (the default), passed as ``tracer=`` to
     :func:`torch.compiler.precompile.capture`.
 
     An execution-driven multi-graph capture that analyzes the Python (bytecode)
@@ -3114,7 +3113,7 @@ def capture(
     *,
     artifact_path: str | os.PathLike[str],
     cache_path: str | os.PathLike[str],
-    tracer: MakeFxTracer | DynamoTracer = MakeFxTracer(),
+    tracer: MakeFxTracer | DynamoTracer = DynamoTracer(),
     backend: str = "inductor",
 ) -> Capture:
     """Capture ``fn`` across the calls YOUR loop makes, writing the artifact on exit.
@@ -3147,14 +3146,14 @@ def capture(
     so compile nothing else there, and do not overlap two such captures.
 
     ``tracer`` picks the capture front-end and carries its tracer-specific
-    configuration. :class:`DynamoTracer` is an execution-driven
+    configuration. :class:`DynamoTracer` (the default) is an execution-driven
     multi-graph capture: it analyzes the Python rather than tracing one path,
     records every graph-break continuation and guarded recompilation the calls
     exercise, takes as many calls as you make (keyword arguments included), and
     the artifact dispatches among the captured variants by their guards -- a call
     no variant covers RAISES rather than silently serving, since there is no
     compiler behind a source artifact. :class:`MakeFxTracer` is one non-strict
-    ATen trace (the default): the capture takes exactly ONE positional call, refuses a second,
+    ATen trace: the capture takes exactly ONE positional call, refuses a second,
     and specializes control flow and shapes to that call, with the contract of
     Note [precompile programming model] in ``torch/_precompile.py``. ``fn`` is
     the whole computation, e.g. ``lambda model, x: model(x)``: the ``nn.Module``
